@@ -1,0 +1,419 @@
+import os
+import re
+import pandas as pd
+import customtkinter as ctk
+from tkinter import filedialog, messagebox, simpledialog
+from pathlib import Path
+import win32com.client as win32
+from datetime import datetime
+import threading
+import tkinter as tk
+
+# ------------- Constants -------------
+REVIEW_PERIOD = "Q2 2025"
+REVIEW_DEADLINE = "June 30, 2025"
+AUDIT_FILE_NAME = f"Audit_CognosAccessReview_{REVIEW_PERIOD.replace(' ','_')}.xlsx"
+
+# =============== Utility Functions ===============
+
+def safe_load_status(path):
+    if os.path.exists(path):
+        return pd.read_excel(path)
+    return pd.DataFrame(
+        columns=["Agency", "Sent Email Date", "Response Received Date", "To", "CC", "Status", "Comments"]
+    )
+
+
+def save_audit_log(df, out_dir):
+    out_path = os.path.join(out_dir, AUDIT_FILE_NAME)
+    df.to_excel(out_path, index=False)
+    return out_path
+
+
+def generate_agency_files(master_file, domain_map_file, out_dir, domain_col):
+    out_dir = Path(out_dir)
+    out_dir.mkdir(exist_ok=True)
+    split_pattern = r"[;,/&]+"
+    df_master = pd.read_excel(master_file)
+    df_map = pd.read_excel(domain_map_file)
+
+    df_master.columns = df_master.columns.str.strip()
+    df_map.columns = df_map.columns.str.strip()
+    df_master[domain_col] = df_master[domain_col].str.lower()
+
+    assigned_idx = set()
+    for _, row in df_map.iterrows():
+        agency = str(row.get("DOMAIN_NAME", "")).strip().upper()
+        domains_raw = str(row.get("domains_included", ""))
+        domains = [d.strip().lower() for d in re.split(split_pattern, domains_raw) if d.strip()]
+        if not domains:
+            continue
+        pattern = "|".join(re.escape(d) for d in domains)
+        matched = df_master[df_master[domain_col].str.contains(pattern, na=False)]
+        if matched.empty:
+            continue
+        assigned_idx.update(matched.index)
+
+        matched_copy = matched.copy()
+        matched_copy["Review Action"] = ""
+        matched_copy["Comments"] = ""
+
+        out_file = out_dir / f"{agency}.xlsx"
+        with pd.ExcelWriter(out_file, engine="xlsxwriter") as writer:
+            matched_copy.to_excel(writer, sheet_name="User Access List", index=False)
+            wb = writer.book
+            ws = writer.sheets["User Access List"]
+            ws.freeze_panes(1, 0)
+            header_fmt = wb.add_format({"bold": True, "bg_color": "#D9E1F2"})
+            for col_idx, col_name in enumerate(matched_copy.columns):
+                ws.write(0, col_idx, col_name, header_fmt)
+                col_width = max(
+                    matched_copy[col_name].astype(str).map(len).max(),
+                    len(col_name),
+                    12
+                ) + 2
+                ws.set_column(col_idx, col_idx, min(col_width, 50))
+
+    unassigned = df_master.loc[~df_master.index.isin(assigned_idx)]
+    if not unassigned.empty:
+        un_file = out_dir / "Unassigned_Domains.xlsx"
+        unassigned.to_excel(un_file, index=False)
+        messagebox.showwarning(
+            "Unassigned Domains",
+            f"{len(unassigned)} users unassigned. Saved to: {un_file}"
+        )
+    return True
+
+
+def send_emails(email_manifest_file, out_dir, agencies, universal_attachment, audit_df, mode="Preview"):
+    df_map = pd.read_excel(email_manifest_file)
+    df_map.columns = df_map.columns.str.strip()
+    addr_dict = {}
+    for _, row in df_map.iterrows():
+        key = str(row.get("Agency", "")).strip().upper().replace(" ", "")
+        to = row.get("To", "") or ""
+        cc = row.get("CC", "") or ""
+        addr_dict[key] = (to.strip(), cc.strip())
+
+    try:
+        outlook = win32.Dispatch("Outlook.Application")
+    except Exception as e:
+        messagebox.showerror("Outlook Error", str(e))
+        return audit_df
+
+    for agency in agencies:
+        key = agency.strip().upper().replace(" ", "")
+        to, cc = addr_dict.get(key, ("", ""))
+        file_path = os.path.join(out_dir, f"{agency}.xlsx")
+        if not os.path.exists(file_path):
+            continue
+
+        mail = outlook.CreateItem(0)
+        mail.Subject = (
+            f"[ACTION REQUIRED] Cognos Access Review - {agency} | {REVIEW_PERIOD} | "
+            f"Deadline: {REVIEW_DEADLINE}"
+        )
+        mail.Body = (
+            f"Hello,\n\n"
+            f"As part of our Sarbanes-Oxley (SOX) compliance requirements, we must complete the "
+            f"{REVIEW_PERIOD} Cognos Platform user access review by {REVIEW_DEADLINE}. Your review and "
+            f"response are critical to ensuring compliance and maintaining appropriate system access.\n\n"
+            f"Action Required:\n"
+            f"1. Review the attached User Access Report listing Cognos Reporting Users and their folder access "
+            f"as of {REVIEW_PERIOD}.\n"
+            f"2. Confirm or request changes:\n"
+            f"   - If no updates are needed, reply confirming your review.\n"
+            f"   - If updates are required, note them in Column G of the \"User Access List\" tab and return the file.\n"
+            f"   - For access changes, submit a Paige ticket under the Cognos Services section.\n\n"
+            f"This review is mandatory for compliance, and your prompt response is essential. "
+            f"Please let me know if you have any questions.\n\n"
+            f"Best Regards,\n"
+            f"Govind Waghmare\n"
+            f"Manager, Financial Applications | Analytics\n"
+            f"Omnicom Group"
+        )
+        mail.Attachments.Add(file_path)
+        if universal_attachment:
+            mail.Attachments.Add(universal_attachment)
+        if to:
+            mail.To = to
+        if cc:
+            mail.CC = cc
+
+        try:
+            if mode == "Direct":
+                mail.Send()
+            else:
+                mail.Display()
+        except Exception as e:
+            messagebox.showerror("Send Error", str(e))
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        mask = (audit_df["Agency"].str.upper() == agency.upper())
+        if mask.any():
+            audit_df.loc[mask, ["Sent Email Date", "To", "CC", "Status"]] = [now, to, cc, "Sent"]
+        else:
+            audit_df.loc[len(audit_df)] = [agency, now, "", to, cc, "Sent", ""]
+
+    return audit_df
+
+
+# =============== Main GUI Application ===============
+class CognosAccessReviewApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("Cognos Access Review Tool")
+        self.geometry("960x960")
+        ctk.set_appearance_mode("System")
+
+        # State
+        self.agencies = []
+        self.audit_df = pd.DataFrame()
+
+        # Theme Selector (Phase 2)
+        theme_frame = ctk.CTkFrame(self)
+        theme_frame.pack(fill="x", padx=24, pady=(10, 0))
+        ctk.CTkLabel(theme_frame, text="Theme:").pack(side="left")
+        self.theme_var = ctk.StringVar(value="System")
+        ctk.CTkOptionMenu(
+            theme_frame, variable=self.theme_var,
+            values=["Light", "Dark", "System"],
+            command=ctk.set_appearance_mode
+        ).pack(side="left", padx=8)
+
+        # Header
+        for font in ["Century Gothic", "Arial Rounded MT Bold", "Futura"]:
+            try:
+                ctk.CTkLabel(
+                    self, text="OmnicomGroup",
+                    font=ctk.CTkFont(family=font, size=52, weight="bold"),
+                    text_color="#0093B2"
+                ).pack(pady=10)
+                break
+            except:
+                continue
+
+        # Input Variables
+        keys = ["master", "domain", "email", "attach", "output"]
+        self.vars = {k: ctk.StringVar() for k in keys}
+        self.email_mode = tk.StringVar(value="Preview")
+
+        # Main Frame Layout
+        main_frame = ctk.CTkFrame(self, corner_radius=12)
+        main_frame.pack(padx=24, pady=8, fill="both", expand=True)
+        for i in range(3):
+            main_frame.grid_columnconfigure(i, weight=1)
+
+        # File Selection Entries
+        labels = [
+            "Master User Access File:",
+            "Agency Domain Mapping File:",
+            "Email Manifest File:",
+            "Universal Attachment (DOCX/PDF):",
+            "Output Folder:"
+        ]
+        for idx, text in enumerate(labels):
+            main_frame.grid_rowconfigure(idx, weight=0)
+            ctk.CTkLabel(main_frame, text=text).grid(
+                row=idx, column=0, sticky="w", pady=4
+            )
+            ctk.CTkEntry(
+                main_frame, textvariable=self.vars[keys[idx]], width=400
+            ).grid(row=idx, column=1, pady=4)
+            cmd = self._browse_folder if idx == 4 else self._browse_file
+            var = self.vars[keys[idx]]
+            ctk.CTkButton(
+                main_frame, text="Browse", command=lambda v=var, f=cmd: f(v)
+            ).grid(row=idx, column=2)
+
+        # Email Mode Radios (Phase 1)
+        ctk.CTkLabel(main_frame, text="Email Mode:").grid(
+            row=5, column=0, sticky="w", pady=8
+        )
+        for j, mode in enumerate(["Preview", "Direct", "Schedule"]):
+            ctk.CTkRadioButton(
+                main_frame, text=mode,
+                variable=self.email_mode, value=mode
+            ).grid(row=5, column=j+1, sticky="w")
+
+        # Agency Listbox
+        ctk.CTkLabel(main_frame, text="Agencies List").grid(
+            row=6, column=0, sticky="w", pady=8
+        )
+        list_frame = ctk.CTkFrame(main_frame)
+        list_frame.grid(row=7, column=0, columnspan=3, sticky="nsew")
+        self.listbox = tk.Listbox(list_frame, selectmode="multiple")
+        self.listbox.pack(side="left", fill="both", expand=True)
+        scrollbar = tk.Scrollbar(
+            list_frame, orient="vertical", command=self.listbox.yview
+        )
+        scrollbar.pack(side="right", fill="y")
+        self.listbox.config(yscrollcommand=scrollbar.set)
+
+        # Action Buttons
+        actions = [
+            ("Generate Files", self.generate),
+            ("Refresh List", self.refresh),
+            ("Send Emails", self.send),
+            ("Mark Responded", self.mark),
+            ("Scan Inbox", self.scan),
+            ("Export Log", self.export)
+        ]
+        for idx, (text, cmd) in enumerate(actions):
+            row = 8 + idx // 3
+            col = idx % 3
+            ctk.CTkButton(
+                main_frame, text=text, command=cmd, width=180
+            ).grid(row=row, column=col, pady=8)
+
+    # Browse Handlers
+    def _browse_file(self, var):
+        path = filedialog.askopenfilename()
+        if path:
+            var.set(path)
+
+    def _browse_folder(self, var):
+        path = filedialog.askdirectory()
+        if path:
+            var.set(path)
+
+    # Button Callbacks
+    def generate(self):
+        generate_agency_files(
+            self.vars["master"].get(),
+            self.vars["domain"].get(),
+            self.vars["output"].get(),
+            "Domain"
+        )
+        self.refresh()
+        messagebox.showinfo("Success", "Agency files created successfully!")
+
+    def refresh(self):
+        out = self.vars["output"].get()
+        files = os.listdir(out) if out else []
+        agencies = [f.replace(".xlsx", "") for f in files if f.endswith(".xlsx")]
+        self.listbox.delete(0, "end")
+        for ag in agencies:
+            self.listbox.insert("end", ag)
+        self.agencies = agencies
+        self.audit_df = safe_load_status(
+            os.path.join(out, AUDIT_FILE_NAME)
+        )
+
+    def send(self):
+        selected = [
+            self.listbox.get(i) for i in self.listbox.curselection()
+        ]
+        if not selected:
+            return messagebox.showwarning(
+                "Warning", "Please select agencies to send emails to."
+            )
+        mode = self.email_mode.get()
+        if mode == "Schedule":
+            dt_str = simpledialog.askstring(
+                "Schedule Email",
+                "Enter send datetime (YYYY-MM-DD HH:MM):"
+            )
+            try:
+                send_time = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
+                delay = (send_time - datetime.now()).total_seconds()
+                threading.Timer(
+                    delay,
+                    lambda: send_emails(
+                        self.vars["email"].get(),
+                        self.vars["output"].get(),
+                        selected,
+                        self.vars["attach"].get(),
+                        self.audit_df,
+                        mode="Direct"
+                    )
+                ).start()
+                messagebox.showinfo(
+                    "Scheduled",
+                    f"Emails scheduled for {dt_str}"
+                )
+            except:
+                messagebox.showerror(
+                    "Invalid Date", "Please use format YYYY-MM-DD HH:MM"
+                )
+        else:
+            self.audit_df = send_emails(
+                self.vars["email"].get(),
+                self.vars["output"].get(),
+                selected,
+                self.vars["attach"].get(),
+                self.audit_df,
+                mode
+            )
+            save_audit_log(
+                self.audit_df, self.vars["output"].get()
+            )
+            messagebox.showinfo(
+                "Done", "Emails processed successfully!"
+            )
+
+    def mark(self):
+        selected = [
+            self.listbox.get(i) for i in self.listbox.curselection()
+        ]
+        if not selected:
+            return messagebox.showwarning(
+                "Warning", "Please select agencies to mark as responded."
+            )
+        comment = simpledialog.askstring(
+            "Add Comment","Enter response comments:"
+        )
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        for agency in selected:
+            mask = self.audit_df["Agency"].str.upper() == agency.upper()
+            if mask.any():
+                self.audit_df.loc[
+                    mask, ["Response Received Date","Status","Comments"]
+                ] = [now, "Responded", comment]
+            else:
+                self.audit_df.loc[len(self.audit_df)] = [
+                    agency, "", now, "", "", "Responded", comment
+                ]
+        save_audit_log(
+            self.audit_df, self.vars["output"].get()
+        )
+        messagebox.showinfo(
+            "Updated", "Marked selected agencies as responded."
+        )
+
+    def scan(self):
+        ns = win32.Dispatch("Outlook.Application").GetNamespace("MAPI")
+        inbox = ns.GetDefaultFolder(6).Items
+        for mail in inbox:
+            if mail.Class != 43:  # MailItem
+                continue
+            subj = mail.Subject.upper()
+            for agency in self.agencies:
+                if agency.upper() in subj:
+                    mask = (
+                        self.audit_df["Agency"].str.upper() == agency.upper()
+                    )
+                    if not (self.audit_df.loc[mask, "Status"] == "Responded").any():
+                        self.audit_df.loc[
+                            mask, "Response Received Date"
+                        ] = mail.ReceivedTime.strftime("%Y-%m-%d %H:%M")
+                        self.audit_df.loc[
+                            mask, "Status"
+                        ] = "Responded"
+        save_audit_log(
+            self.audit_df, self.vars["output"].get()
+        )
+        messagebox.showinfo(
+            "Inbox Scan", "Inbox scanned and responses logged."
+        )
+
+    def export(self):
+        path = save_audit_log(
+            self.audit_df, self.vars["output"].get()
+        )
+        messagebox.showinfo("Export", f"Audit log saved to {path}")
+
+
+if __name__ == "__main__":
+    app = CognosAccessReviewApp()
+    app.mainloop()
